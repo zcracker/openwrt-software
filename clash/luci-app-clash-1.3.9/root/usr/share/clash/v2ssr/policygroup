@@ -1,0 +1,47 @@
+
+config groups
+	option old_name 'AdBlock'
+	option old_name_cfg 'AdBlock'
+	option type 'select'
+	list other_group 'REJECT'
+	option name 'AdBlock'
+
+config groups
+	option old_name 'AsianTV'
+	option old_name_cfg 'AsianTV'
+	option type 'select'
+	option name 'AsianTV'
+	list other_group 'DIRECT'
+	list other_group 'Proxy'
+
+config groups
+	option old_name 'GlobalTV'
+	option old_name_cfg 'GlobalTV'
+	option type 'select'
+	option name 'GlobalTV'
+	list other_group 'ALL'
+
+config groups
+	option type 'select'
+	option name 'Proxy'
+	list other_group 'ALL'
+	list other_group 'LoadBalance'
+	list other_group 'UrlTest'
+
+config groups
+	option name 'UrlTest'
+	option old_name 'UrlTest'
+	option old_name_cfg 'UrlTest'
+	option type 'url-test'
+	option test_url 'http://www.gstatic.com/generate_204'
+	option test_interval '600'
+	list other_group 'ALL'
+
+config groups
+	option name 'LoadBalance'
+	option old_name 'LoadBalance'
+	option old_name_cfg 'LoadBalance'
+	option type 'load-balance'
+	option test_url 'http://www.gstatic.com/generate_204'
+	option test_interval '600'
+	list other_group 'ALL'
