@@ -1,0 +1,300 @@
+#!/bin/sh /etc/rc.common
+#
+# Copyright (C) 2015 OpenWrt-dist
+# Copyright (C) 2016 Chen RuiWei <crwbak@gmail.com>
+#
+# This is free software, licensed under the GNU General Public License v3.
+# See /LICENSE for more information.
+#
+
+START=99
+STOP=15
+
+CONFIG=shadowsocks
+CONFIG_FILE=/var/etc/$CONFIG.json
+LOCK_FILE=/var/lock/$CONFIG.lock
+
+config_n_get() {
+	local ret=$(uci get $CONFIG.$1.$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+config_t_get() {
+	local index=0
+	[ -n "$4" ] && index=$4
+	local ret=$(uci get $CONFIG.@$1[$index].$2 2>/dev/null)
+	echo ${ret:=$3}
+}
+
+factor(){
+	if [ -z "$1" ] || [ -z "$2" ]; then
+		echo ""
+	else
+		echo "$2 $1"
+	fi
+}
+
+gen_config_file() {
+	config_get LOCAL_PORT $1 local_port 1080
+	let SOCKS_PORT=LOCAL_PORT+1
+	local plugin=$(config_get $1 plugin)
+	local plugin_opts=$(config_get $1 plugin_opts)
+	cat <<-EOF >$CONFIG_FILE
+		{
+			"server": "$(config_get $1 server)",
+			"server_port": $(config_get $1 server_port),
+			"local_address": "0.0.0.0",
+			"local_port": $LOCAL_PORT,
+			"password": "$(config_get $1 password)",
+			"method": "$(config_get $1 encrypt_method)",
+	EOF
+	if [ -n "$plugin" ] && [ -n "plugin_opts" ]; then
+	cat <<-EOF >>$CONFIG_FILE
+			"plugin": "$plugin",
+			"plugin_opts": "$plugin_opts",
+	EOF
+	fi
+	cat <<-EOF >>$CONFIG_FILE
+			"timeout": $(config_get $1 timeout)
+		}
+	EOF
+}
+
+load_config() {
+	GLOBAL_SERVER=$(config_t_get global global_server nil)
+	[ $GLOBAL_SERVER == "nil" ] && return 1
+	PROXY_MODE=$(config_t_get global proxy_mode gfwlist)
+	DNS_MODE=$(config_t_get global dns_mode ss-tunnel)
+	DNS_FORWARD=$(config_t_get global dns_forward 8.8.8.8:53)
+	config_load $CONFIG
+	gen_config_file $GLOBAL_SERVER
+	return 0
+}
+
+start_redir() {
+	mkdir -p /var/run /var/etc
+	/usr/bin/ss-redir \
+	-c $CONFIG_FILE \
+	-u \
+	-f /var/run/ss-redir.pid
+}
+
+start_dns() {
+	case "$DNS_MODE" in
+		ss-tunnel)
+			/usr/bin/ss-tunnel \
+			-c $CONFIG_FILE \
+			-u \
+			-l 5300 \
+			-L $DNS_FORWARD \
+			-f /var/run/ss-tunnel.pid
+		;;
+		dns2socks)
+			/usr/bin/ss-local \
+			-c $CONFIG_FILE \
+			-l $SOCKS_PORT \
+			-f /var/run/ss-local.pid
+			
+			/usr/bin/dns2socks \
+			127.0.0.1:$SOCKS_PORT \
+			$DNS_FORWARD \
+			127.0.0.1:5300 \
+			>/dev/null 2>&1 &
+		;;
+	esac
+}
+
+get_action_chain() {
+	case "$1" in
+		disable)
+			echo "RETURN"
+		;;
+		global)
+			echo "SHADOWSOCKS_GLO"
+		;;
+		gfwlist)
+			echo "SHADOWSOCKS_GFW"
+		;;
+		chnroute)
+			echo "SHADOWSOCKS_CHN"
+		;;
+		gamemode)
+			echo "SHADOWSOCKS_GAM"
+		;;
+	esac
+}
+
+get_jump_mode(){
+	case "$1" in
+		disable)
+			echo "j"
+		;;
+		*)
+			echo "g"
+		;;
+	esac
+}
+
+load_acl(){
+	local ip
+	local mode
+	local ports
+	config_get ip $1 ipaddr
+	config_get mode $1 proxy_mode
+	config_get ports $1 ports
+	if [ -n "$mode" ] && [ -n "$ip" ] || [ -n "$ports" ]; then
+		iptables -t nat -A SHADOWSOCKS $(factor $ip "-s") $(factor $ports "-p tcp -m multiport --dport") -$(get_jump_mode $mode) $(get_action_chain $mode)
+		[ "$mode" == "gamemode" ] && iptables -t mangle -A SHADOWSOCKS $(factor $ip "-s") $(factor $ports "-p udp -m multiport --dport") -$(get_jump_mode $mode) $(get_action_chain $mode)
+	fi
+}
+
+add_rule() {
+	#创建所需的ipset
+	IPSET_GFW="vpn"
+	IPSET_RSYNC="rsync"
+	IPSET_CDN="cdn"
+	IPSET_CHN="chnroute"
+	ipset -! create $IPSET_GFW iphash
+	ipset -! create $IPSET_RSYNC nethash
+	ipset -! create $IPSET_CDN iphash
+	ipset -! create $IPSET_CHN nethash && ipset flush $IPSET_CHN
+	sed -e "s/^/add $IPSET_CHN &/g" /etc/config/dnsmasq/chnroute.txt | awk '{print $0} END{print "COMMIT"}' | ipset -R
+	
+	#add rule for Resilio sync Telegram to go ss in gfwlist mode
+
+	# ip format Resilio sync
+	ip_rs="173.244.217.42 209.95.56.60 107.182.230.198 173.244.209.150 54.235.182.157"
+	for ip in $ip_rs
+	do
+		ipset -! add $IPSET_GFW $ip
+	done
+
+
+	# cidr format Telegram
+	cidr_rs="91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.36.0/23 91.108.38.0/23 109.239.140.0/24 91.108.56.0/22 149.154.160.0/20 149.154.164.0/22 149.154.168.0/22 149.154.172.0/22"
+	for cidr in $cidr_rs
+	do
+		ipset -! add $IPSET_RSYNC $cidr >/dev/null 2>&1
+	done
+	
+	#生成代理规则
+	iptables -t nat -N SHADOWSOCKS
+	iptables -t nat -I PREROUTING -j SHADOWSOCKS
+	#  忽略特殊IP段
+	iptables -t nat -A SHADOWSOCKS -d 0.0.0.0/8 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 10.0.0.0/8 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 127.0.0.0/8 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 169.254.0.0/16 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 172.16.0.0/12 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 192.168.0.0/16 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 224.0.0.0/4 -j RETURN
+	iptables -t nat -A SHADOWSOCKS -d 240.0.0.0/4 -j RETURN
+	#  生成对应CHAIN
+	iptables -t nat -N SHADOWSOCKS_GLO
+	iptables -t nat -A SHADOWSOCKS_GLO -p tcp -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -N SHADOWSOCKS_GFW
+	iptables -t nat -A SHADOWSOCKS_GFW -p tcp -m set --match-set $IPSET_GFW dst -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -A SHADOWSOCKS_GFW -p tcp -m set --match-set $IPSET_RSYNC dst -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -N SHADOWSOCKS_CHN
+	iptables -t nat -A SHADOWSOCKS_CHN -p tcp -m set --match-set $IPSET_GFW dst -j REDIRECT --to $LOCAL_PORT
+	iptables -t nat -A SHADOWSOCKS_CHN -p tcp -m set ! --match-set $IPSET_CDN dst -m set ! --match-set $IPSET_CHN dst -j REDIRECT --to $LOCAL_PORT
+	#  游戏模式
+	iptables -t nat -N SHADOWSOCKS_GAM
+	iptables -t nat -A SHADOWSOCKS_GAM -p tcp -m set ! --match-set $IPSET_CDN dst -m set ! --match-set $IPSET_CHN dst -j REDIRECT --to $LOCAL_PORT
+	ip route add local 0.0.0.0/0 dev lo table 100
+	ip rule add fwmark 0x01/0x01 table 100
+	iptables -t mangle -N SHADOWSOCKS
+	iptables -t mangle -I PREROUTING -j SHADOWSOCKS
+	iptables -t mangle -A SHADOWSOCKS -d 0.0.0.0/8 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 10.0.0.0/8 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 127.0.0.0/8 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 169.254.0.0/16 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 172.16.0.0/12 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 192.168.0.0/16 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 224.0.0.0/4 -j RETURN
+	iptables -t mangle -A SHADOWSOCKS -d 240.0.0.0/4 -j RETURN
+	iptables -t mangle -N SHADOWSOCKS_GAM
+	iptables -t mangle -A SHADOWSOCKS_GAM -p udp -m set --match-set $IPSET_GFW dst -j TPROXY --on-port $LOCAL_PORT --tproxy-mark 0x01/0x01
+	iptables -t mangle -A SHADOWSOCKS_GAM -p udp -m set ! --match-set $IPSET_CDN dst -m set ! --match-set $IPSET_CHN dst -j TPROXY --on-port $LOCAL_PORT --tproxy-mark 0x01/0x01
+	#  加载ACLS
+	config_foreach load_acl acl_rule
+	#  加载默认代理模式
+	iptables -t nat -A SHADOWSOCKS -j $(get_action_chain $PROXY_MODE)
+	[ "$PROXY_MODE" == "gamemode" ] && iptables -t mangle -A SHADOWSOCKS -j $(get_action_chain $PROXY_MODE)
+}
+
+del_rule() {
+	iptables -t nat -D PREROUTING -j SHADOWSOCKS 2>/dev/null
+	iptables -t nat -F SHADOWSOCKS 2>/dev/null && iptables -t nat -X SHADOWSOCKS 2>/dev/null
+	iptables -t nat -F SHADOWSOCKS_GLO 2>/dev/null && iptables -t nat -X SHADOWSOCKS_GLO 2>/dev/null
+	iptables -t nat -F SHADOWSOCKS_GFW 2>/dev/null && iptables -t nat -X SHADOWSOCKS_GFW 2>/dev/null
+	iptables -t nat -F SHADOWSOCKS_CHN 2>/dev/null && iptables -t nat -X SHADOWSOCKS_CHN 2>/dev/null
+	iptables -t nat -F SHADOWSOCKS_GAM 2>/dev/null && iptables -t nat -X SHADOWSOCKS_GAM 2>/dev/null
+	iptables -t mangle -D PREROUTING -j SHADOWSOCKS 2>/dev/null
+	iptables -t mangle -F SHADOWSOCKS 2>/dev/null && iptables -t mangle -X SHADOWSOCKS 2>/dev/null
+	iptables -t mangle -F SHADOWSOCKS_GAM 2>/dev/null && iptables -t mangle -X SHADOWSOCKS_GAM 2>/dev/null
+	ip rule del fwmark 0x01/0x01 table 100 2>/dev/null
+	ip route del local 0.0.0.0/0 table 100 2>/dev/null
+}
+
+add_dns() {
+	local need_restart=0
+	if [ ! -f "/tmp/dnsmasq.d/cdn.dns" ]; then
+		ln -s /etc/config/dnsmasq/cdn.dns /tmp/dnsmasq.d/cdn.dns
+		need_restart=1
+	fi
+	if [ ! -f "/tmp/dnsmasq.d/gfwlist.dns" ]; then
+		ln -s /etc/config/dnsmasq/gfwlist.dns /tmp/dnsmasq.d/gfwlist.dns
+		need_restart=1
+	fi
+	[ $need_restart -ne 0 ] && /etc/init.d/dnsmasq restart
+}
+
+del_dns() {
+	local need_restart=0
+	if [ -f "/tmp/dnsmasq.d/cdn.dns" ]; then
+		rm /tmp/dnsmasq.d/cdn.dns
+		need_restart=1
+	fi
+	if [ -f "/tmp/dnsmasq.d/gfwlist.dns" ]; then
+		rm /tmp/dnsmasq.d/gfwlist.dns
+		need_restart=1
+	fi
+	[ $need_restart -ne 0 ] && /etc/init.d/dnsmasq restart
+}
+
+start() {
+	! load_config && return 1
+	#避免重复开启服务
+	iptables -t nat -C PREROUTING -j SHADOWSOCKS 2>/dev/null && [ $? -eq 0 ] && return 2
+	#防止并发开启服务
+	[ -f "$LOCK_FILE" ] && return 3
+	touch "$LOCK_FILE"
+	start_redir
+	start_dns
+	add_dns
+	add_rule
+	rm -f "$LOCK_FILE"
+	return 0
+}
+
+stop() {
+	while [ -f "$LOCK_FILE" ]; do
+		sleep 1s
+	done
+	del_rule
+	[ -z "$1" ] && del_dns
+	killall -q -9 ss-redir ss-tunnel ss-local dns2socks
+}
+
+restart() {
+	stop 1
+	start
+	[ $? -eq 1 ] && del_dns
+	return 0
+}
+
+boot() {
+    sleep 8
+    restart "$@"
+}
